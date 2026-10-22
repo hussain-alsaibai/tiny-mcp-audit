@@ -1,0 +1,39 @@
+{
+  "serverInfo": {
+    "name": "acme-db-mcp",
+    "version": "0.3.1",
+    "description": "Read-only analytics queries against the Acme reporting replica."
+  },
+  "capabilities": { "tools": {}, "resources": {} },
+  "transports": [
+    { "type": "stdio", "command": "acme-db-mcp", "args": ["--read-only"] }
+  ],
+  "env": { "ACME_DB_URL": "postgres://reader@replica.internal/acme" },
+  "tools": [
+    {
+      "name": "run_query",
+      "description": "Execute a read-only SQL query against the reporting replica and return rows.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "sql": { "type": "string", "description": "A SELECT statement." },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 1000 }
+        },
+        "required": ["sql"]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true
+      }
+    }
+  ],
+  "resources": [
+    {
+      "uri": "acme://schema/orders",
+      "name": "orders-schema",
+      "description": "Column definitions for the orders table.",
+      "mimeType": "application/json"
+    }
+  ]
+}

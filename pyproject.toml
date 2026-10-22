@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tiny-mcp-audit"
+version = "0.1.0"
+description = "Zero-dependency static security auditor for MCP server manifests"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [{name = "Hussain AlSaibai"}]
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "security",
+    "audit",
+    "static-analysis",
+    "manifest",
+    "llm",
+    "agent",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-cov"]
+
+[project.scripts]
+mcp-audit = "tiny_mcp_audit:main"
+
+[project.urls]
+Homepage = "https://github.com/hussain-alsaibai/tiny-mcp-audit"
+Repository = "https://github.com/hussain-alsaibai/tiny-mcp-audit"
+Issues = "https://github.com/hussain-alsaibai/tiny-mcp-audit/issues"
+
+[tool.setuptools]
+py-modules = ["tiny_mcp_audit"]
+
+[tool.pytest.ini_options]
+testpaths = ["test_tiny_mcp_audit.py"]
