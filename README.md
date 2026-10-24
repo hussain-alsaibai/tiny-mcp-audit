@@ -87,7 +87,7 @@ Exit codes: `0` clean - `1` findings at or above `--fail-on` (default `high`) - 
 | MCP060 | low | tool missing `readOnlyHint` / `destructiveHint` |
 | MCP061 | low | `readOnlyHint` present but not boolean |
 | MCP070 | high | protocol version missing, malformed, or older than the current revision |
-| MCP071 | high | server still exposes a method the current revision removed |
+| MCP071 | high / info | server exposes a removed method; **info** when `server/discover` is also implemented (recommended bridge) |
 | MCP072 | medium | server advertises a deprecated capability (roots / sampling / logging) |
 | MCP073 | medium | server advertises a deprecated transport (HTTP+SSE) |
 
@@ -115,6 +115,26 @@ The revision is looked up in `protocolVersion`, `protocol_version`,
 `specVersion`, `discover.protocolVersions`, and
 `_meta.io.modelcontextprotocol/protocolVersion`, so it works against both a
 raw manifest and a captured `server/discover` response.
+
+### The dual-dialect bridge
+
+MCP071 is **high** when a server exposes a removed method *without*
+implementing `server/discover` — such a server is unreachable to current
+clients.
+
+It drops to **info** when `server/discover` *is* implemented. A live probe of
+79 registry servers (2026-10-24) found that every server speaking the current
+dialect also kept its legacy `initialize` handler, and none removed it.
+Keeping the old handler as a compatibility shim is the pattern that actually
+works, so the tool does not flag it as a problem.
+
+```
+legacy server (unreachable)      bridge (recommended)
+  [HIGH] MCP070  version '1.0'     [INFO] MCP071 initialize kept as a shim
+  [HIGH] MCP071  initialize        grade A, does not block CI
+  [HIGH] MCP071  ping
+  grade F, blocks CI
+```
 
 ## Design notes
 

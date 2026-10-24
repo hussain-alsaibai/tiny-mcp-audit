@@ -603,12 +603,33 @@ def test_version_found_in_discover():
 
 
 def test_removed_initialize_method_is_high():
+    # No server/discover: the server is unreachable to current clients.
     findings = report_finding_codes(
         modern_manifest(methods=["initialize", "tools/list"]), "MCP071"
     )
     assert findings
     assert findings[0].severity is Severity.HIGH
     assert "initialize" in findings[0].message
+
+
+def test_dual_dialect_bridge_keeps_initialize():
+    """Keeping initialize alongside server/discover is the recommended
+    pattern: every current-dialect server observed in the wild did it."""
+    manifest = modern_manifest(
+        methods=["server/discover", "tools/list", "tools/call", "initialize"]
+    )
+    findings = report_finding_codes(manifest, "MCP071")
+    assert findings
+    assert findings[0].severity is Severity.INFO
+    assert "shim" in findings[0].message
+
+
+def test_dual_dialect_bridge_does_not_block_ci():
+    manifest = modern_manifest(
+        methods=["server/discover", "tools/list", "tools/call", "initialize"]
+    )
+    report = audit_manifest(manifest)
+    assert report.has_blocking is False
 
 
 def test_removed_ping_method_is_high():

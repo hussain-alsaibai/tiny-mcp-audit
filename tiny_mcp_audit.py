@@ -840,6 +840,21 @@ def _find_protocol_version(manifest):
     return "", ""
 
 
+def _implements_discover(manifest):
+    """True when the server implements server/discover.
+
+    The 2026-07-28 revision made this RPC mandatory. A server that
+    implements it can serve current clients; one that does not is
+    unreachable to them.
+    """
+    for key in ("methods", "implementedMethods", "advertisedMethods"):
+        collection = manifest.get(key)
+        if isinstance(collection, (list, tuple)) and "server/discover" in collection:
+            return True
+    discover = manifest.get("discover") or manifest.get("server/discover")
+    return isinstance(discover, Mapping)
+
+
 def _check_protocol(report, manifest):
     """MCP070-MCP073: conformance with the current MCP spec revision.
 
@@ -932,7 +947,30 @@ def _check_protocol(report, manifest):
         caps = manifest.get("capabilities")
         if isinstance(caps, Mapping) and "initialize" in caps:
             removed_seen["initialize"] = "capabilities"
+
+    # A server that also implements server/discover is a dual-dialect
+    # bridge: it keeps the legacy handler as a compatibility shim so
+    # older clients still connect. A live probe of 79 registry servers
+    # found every current-dialect server did exactly this, and none
+    # removed initialize. Keeping it is the recommended pattern, so it
+    # is informational rather than a finding.
+    is_bridge = _implements_discover(manifest)
+
     for method, source in sorted(removed_seen.items()):
+        if is_bridge:
+            report.add(
+                "MCP071",
+                Severity.INFO,
+                "server keeps removed method " + repr(method) + " as a "
+                "backwards-compatible shim (server/discover is also implemented)",
+                location=source,
+                remediation=(
+                    "This is the recommended dual-dialect bridge. Keep it until "
+                    "legacy clients are no longer a concern."
+                ),
+                evidence={"method": method, "source": source, "bridge": True},
+            )
+            continue
         report.add(
             "MCP071",
             Severity.HIGH,
@@ -940,10 +978,11 @@ def _check_protocol(report, manifest):
             + REMOVED_METHODS[method],
             location=source,
             remediation=(
-                "Remove the method and implement server/discover plus the "
-                "stateless request shape (protocol version in _meta)."
+                "Implement server/discover plus the stateless request shape "
+                "(protocol version in _meta). Without server/discover no "
+                "current client can negotiate with this server."
             ),
-            evidence={"method": method, "source": source},
+            evidence={"method": method, "source": source, "bridge": False},
         )
 
     # MCP072: deprecated capabilities.
