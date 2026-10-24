@@ -7,14 +7,21 @@ from tiny_mcp_audit import Severity, audit_json, audit_manifest
 
 
 def good_manifest():
-    """A manifest that should pass cleanly."""
+    """A manifest that should pass cleanly.
+
+    Conforms to the current MCP spec revision: declares a date-shaped
+    protocolVersion, implements server/discover, and advertises no
+    deprecated capability or transport.
+    """
     return {
+        "protocolVersion": "2026-07-28",
         "serverInfo": {
             "name": "weather-mcp",
             "version": "1.4.2",
             "description": "Read-only weather lookups for a city.",
         },
         "capabilities": {"tools": {}},
+        "methods": ["server/discover", "tools/list", "tools/call"],
         "tools": [
             {
                 "name": "get_forecast",
@@ -486,6 +493,232 @@ def test_cli_unreadable_file_returns_three(capsys):
 
 def test_version_is_exported():
     assert mcp.__version__.count(".") == 2
+
+
+
+# ---------- MCP070-MCP073: protocol conformance ----------
+
+CURRENT = mcp.CURRENT_SPEC_REVISION
+
+
+def modern_manifest(**overrides):
+    """A manifest that conforms to the current spec revision."""
+    manifest = {
+        "protocolVersion": CURRENT,
+        "serverInfo": {
+            "name": "modern-mcp",
+            "version": "2.0.1",
+            "description": "A server that speaks the current protocol.",
+        },
+        "capabilities": {"tools": {"listChanged": False}},
+        "methods": ["server/discover", "tools/list", "tools/call"],
+        "transports": [{"type": "streamable-http", "url": "https://example.com/mcp"}],
+        "tools": [
+            {
+                "name": "get_forecast",
+                "description": "Return a 5-day forecast for the given city name.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+                "annotations": {"readOnlyHint": True, "destructiveHint": False},
+            }
+        ],
+    }
+    manifest.update(overrides)
+    return manifest
+
+
+def test_current_revision_is_a_date():
+    assert mcp._parse_revision(CURRENT) == (2026, 7, 28)
+    assert mcp._parse_revision("not-a-date") is None
+    assert mcp._parse_revision("2026-13-01") is None
+
+
+def test_modern_manifest_passes_protocol_checks():
+    report = audit_manifest(modern_manifest())
+    assert not report.find("MCP070")
+    assert not report.find("MCP071")
+    assert not report.find("MCP072")
+    assert not report.find("MCP073")
+
+
+def test_missing_protocol_version_is_high():
+    manifest = modern_manifest()
+    del manifest["protocolVersion"]
+    findings = report_finding_codes(manifest, "MCP070")
+    assert findings
+    assert findings[0].severity is Severity.HIGH
+    assert "no protocol version" in findings[0].message
+
+
+def test_legacy_version_one_zero_is_high():
+    findings = report_finding_codes(
+        modern_manifest(protocolVersion="1.0"), "MCP070"
+    )
+    assert findings
+    assert findings[0].severity is Severity.HIGH
+    assert "date-based" in findings[0].message
+
+
+def test_pre_2025_revision_is_high():
+    findings = report_finding_codes(
+        modern_manifest(protocolVersion="2025-06-18"), "MCP070"
+    )
+    assert findings
+    assert findings[0].severity is Severity.HIGH
+
+
+def test_older_date_revision_is_high():
+    findings = report_finding_codes(
+        modern_manifest(protocolVersion="2025-11-25"), "MCP070"
+    )
+    assert findings
+    assert findings[0].severity is Severity.HIGH
+    assert "older than the current revision" in findings[0].message
+
+
+def test_non_date_version_is_medium():
+    findings = report_finding_codes(
+        modern_manifest(protocolVersion="v2"), "MCP070"
+    )
+    assert findings
+    assert findings[0].severity is Severity.MEDIUM
+    assert "not a YYYY-MM-DD revision" in findings[0].message
+
+
+def test_version_found_in_meta():
+    manifest = modern_manifest()
+    del manifest["protocolVersion"]
+    manifest["_meta"] = {"io.modelcontextprotocol/protocolVersion": CURRENT}
+    assert not report_finding_codes(manifest, "MCP070")
+
+
+def test_version_found_in_discover():
+    manifest = modern_manifest()
+    del manifest["protocolVersion"]
+    manifest["discover"] = {"protocolVersions": [CURRENT]}
+    assert not report_finding_codes(manifest, "MCP070")
+
+
+def test_removed_initialize_method_is_high():
+    findings = report_finding_codes(
+        modern_manifest(methods=["initialize", "tools/list"]), "MCP071"
+    )
+    assert findings
+    assert findings[0].severity is Severity.HIGH
+    assert "initialize" in findings[0].message
+
+
+def test_removed_ping_method_is_high():
+    findings = report_finding_codes(modern_manifest(methods=["ping"]), "MCP071")
+    assert findings
+    assert "ping" in findings[0].message
+
+
+def test_removed_subscribe_method_is_high():
+    findings = report_finding_codes(
+        modern_manifest(methods=["resources/subscribe"]), "MCP071"
+    )
+    assert findings
+    assert "subscriptions/listen" in findings[0].message
+
+
+def test_initialize_in_capabilities_is_flagged():
+    findings = report_finding_codes(
+        modern_manifest(capabilities={"initialize": {}, "tools": {}}), "MCP071"
+    )
+    assert findings
+    assert "initialize" in findings[0].message
+
+
+def test_advertised_methods_are_scanned():
+    findings = report_finding_codes(
+        modern_manifest(advertisedMethods=["logging/setLevel"]), "MCP071"
+    )
+    assert findings
+    assert "logging/setLevel" in findings[0].message
+
+
+def test_deprecated_roots_capability_is_medium():
+    findings = report_finding_codes(
+        modern_manifest(capabilities={"roots": {"listChanged": True}, "tools": {}}),
+        "MCP072",
+    )
+    assert findings
+    assert findings[0].severity is Severity.MEDIUM
+    assert "roots" in findings[0].message
+
+
+def test_deprecated_sampling_capability_is_flagged():
+    findings = report_finding_codes(
+        modern_manifest(capabilities={"sampling": {}, "tools": {}}), "MCP072"
+    )
+    assert findings
+    assert "sampling" in findings[0].message
+
+
+def test_deprecated_sse_transport_is_medium():
+    findings = report_finding_codes(
+        modern_manifest(
+            transports=[{"type": "sse", "url": "https://example.com/sse"}]
+        ),
+        "MCP073",
+    )
+    assert findings
+    assert findings[0].severity is Severity.MEDIUM
+    assert "sse" in findings[0].message
+
+
+def test_deprecated_transport_field_is_flagged():
+    findings = report_finding_codes(
+        modern_manifest(transport="sse"), "MCP073"
+    )
+    assert findings
+    assert "sse" in findings[0].message
+
+
+def test_streamable_http_transport_is_not_flagged():
+    findings = report_finding_codes(
+        modern_manifest(
+            transports=[{"type": "streamable-http", "url": "https://example.com/mcp"}]
+        ),
+        "MCP073",
+    )
+    assert not findings
+
+
+def test_protocol_check_is_selectable():
+    manifest = modern_manifest()
+    del manifest["protocolVersion"]
+    report = audit_manifest(manifest, checks=["protocol"])
+    assert report.find("MCP070")
+    assert not report.find("MCP001")
+
+
+def test_protocol_check_in_check_names():
+    assert "protocol" in mcp.CHECK_NAMES
+
+
+def test_protocol_constants_exported():
+    assert "initialize" in mcp.REMOVED_METHODS
+    assert "roots" in mcp.DEPRECATED_CAPABILITIES
+    assert "sse" in mcp.DEPRECATED_TRANSPORTS
+
+
+def test_legacy_server_fails_multiple_protocol_checks():
+    """The exact shape of a pre-2026 server: version 1.0 plus initialize."""
+    legacy = {
+        "protocolVersion": "1.0",
+        "serverInfo": {"name": "legacy", "version": "0.1.0"},
+        "capabilities": {"tools": {}},
+        "methods": ["initialize", "tools/list", "tools/call", "ping"],
+    }
+    report = audit_manifest(legacy)
+    assert report.find("MCP070")
+    assert report.find("MCP071")
+    assert report.has_blocking is True
 
 
 def test_public_api_exported():

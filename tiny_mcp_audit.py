@@ -39,7 +39,7 @@ from enum import Enum
 from typing import Any, Iterable, Mapping
 
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
 # ---------- Severity ----------
@@ -722,6 +722,280 @@ def _check_annotations(report, manifest):
             )
 
 
+# ---------- Protocol conformance (MCP spec 2026-07-28) ----------
+
+# The current specification revision. Date-based, not semver: the spec
+# moved to YYYY-MM-DD revisions with the 2025-11-25 revision, and
+# 2026-07-28 removed the initialize handshake entirely.
+CURRENT_SPEC_REVISION = "2026-07-28"
+
+# The revision that introduced the date-based scheme. Anything before this
+# cannot be expressed as a date revision, so it predates the scheme.
+FIRST_DATE_REVISION = "2025-11-25"
+
+# Methods that the 2026-07-28 revision removed. A server that still
+# advertises or implements these is speaking a pre-2026 dialect.
+REMOVED_METHODS = {
+    "initialize": "the initialize handshake was removed; MCP is now stateless",
+    "notifications/initialized": "the initialized notification was removed",
+    "logging/setLevel": "log level is now set per-request via _meta",
+    "ping": "ping was removed as a core method",
+    "notifications/roots/list_changed": "the Roots feature is deprecated",
+    "roots/list": "the Roots feature is deprecated",
+    "sampling/createMessage": "the Sampling feature is deprecated",
+    "notifications/message": "the Logging feature is deprecated",
+    "resources/subscribe": "replaced by subscriptions/listen",
+    "resources/unsubscribe": "replaced by subscriptions/listen",
+    "tasks/result": "moved to the io.modelcontextprotocol/tasks extension",
+    "tasks/list": "moved to the io.modelcontextprotocol/tasks extension",
+    "notifications/elicitation/complete": "removed in favour of the MRTR retry pattern",
+}
+
+# Capabilities whose underlying features are deprecated. Advertising them
+# is not an error, but it signals a server built against an older spec.
+DEPRECATED_CAPABILITIES = {
+    "roots": "the Roots feature is deprecated (SEP-2577)",
+    "sampling": "the Sampling feature is deprecated (SEP-2577)",
+    "logging": "the Logging feature is deprecated (SEP-2577)",
+}
+
+# Transports the spec has deprecated. HTTP+SSE was deprecated as early as
+# protocol version 2025-03-26 and is reclassified as Deprecated under the
+# feature lifecycle policy (SEP-2596).
+DEPRECATED_TRANSPORTS = {
+    "sse": "the HTTP+SSE transport is deprecated; migrate to Streamable HTTP",
+    "http+sse": "the HTTP+SSE transport is deprecated; migrate to Streamable HTTP",
+}
+
+# A protocol revision string is a date: YYYY-MM-DD.
+_REVISION_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+
+# Pre-date-revision version strings that some servers still advertise.
+LEGACY_PROTOCOL_VERSIONS = {
+    "1.0",
+    "2024-11-05",
+    "2025-03-26",
+    "2025-06-18",
+}
+
+
+def _parse_revision(value):
+    """Parse a date-shaped spec revision into a comparable tuple.
+
+    Returns None when the string is not a YYYY-MM-DD revision.
+    """
+    if not isinstance(value, str):
+        return None
+    match = _REVISION_RE.match(value.strip())
+    if not match:
+        return None
+    year, month, day = (int(part) for part in match.groups())
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return None
+    return (year, month, day)
+
+
+def _revision_is_older(revision, minimum):
+    """True when revision parses and sorts before minimum."""
+    parsed = _parse_revision(revision)
+    floor = _parse_revision(minimum)
+    if parsed is None or floor is None:
+        return False
+    return parsed < floor
+
+
+def _find_protocol_version(manifest):
+    """Locate the declared protocol version in a manifest, if any.
+
+    Returns (value, location). The location is the dotted path the value
+    was found at, or "" when nothing was found.
+    """
+    candidates = (
+        ("protocolVersion", manifest.get("protocolVersion")),
+        ("protocol_version", manifest.get("protocol_version")),
+        ("specVersion", manifest.get("specVersion")),
+    )
+    for key, value in candidates:
+        if isinstance(value, str) and value.strip():
+            return value.strip(), key
+    # The discover response nests the supported versions.
+    discover = manifest.get("discover") or manifest.get("server/discover")
+    if isinstance(discover, Mapping):
+        for key in ("protocolVersion", "protocol_version", "specVersion"):
+            value = discover.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip(), "discover." + key
+        versions = discover.get("protocolVersions") or discover.get(
+            "supportedProtocolVersions"
+        )
+        if isinstance(versions, list) and versions:
+            first = versions[0]
+            if isinstance(first, str) and first.strip():
+                return first.strip(), "discover.protocolVersions[0]"
+    meta = manifest.get("_meta")
+    if isinstance(meta, Mapping):
+        value = meta.get("io.modelcontextprotocol/protocolVersion")
+        if isinstance(value, str) and value.strip():
+            return value.strip(), "_meta.io.modelcontextprotocol/protocolVersion"
+    return "", ""
+
+
+def _check_protocol(report, manifest):
+    """MCP070-MCP073: conformance with the current MCP spec revision.
+
+    Covers the four failure modes that make a server invisible to
+    modern clients:
+
+    - MCP070: the declared protocol version is missing, malformed, or
+      older than the current revision.
+    - MCP071: the server still implements or advertises a method that
+      the current revision removed.
+    - MCP072: the server advertises a deprecated capability.
+    - MCP073: the server advertises a deprecated transport.
+    """
+    version, location = _find_protocol_version(manifest)
+
+    if not version:
+        report.add(
+            "MCP070",
+            Severity.HIGH,
+            "manifest declares no protocol version - current clients cannot "
+            "select a compatible revision",
+            location="protocolVersion",
+            remediation=(
+                "Declare protocolVersion as a date revision (currently "
+                + CURRENT_SPEC_REVISION
+                + ") and implement server/discover."
+            ),
+        )
+    elif _parse_revision(version) is None:
+        if version in LEGACY_PROTOCOL_VERSIONS:
+            report.add(
+                "MCP070",
+                Severity.HIGH,
+                "protocol version " + repr(version) + " predates the date-based "
+                "revision scheme - modern clients will not negotiate it",
+                location=location,
+                remediation=(
+                    "Move to the date-based revision scheme and declare "
+                    + CURRENT_SPEC_REVISION
+                    + "."
+                ),
+                evidence={"version": version},
+            )
+        else:
+            report.add(
+                "MCP070",
+                Severity.MEDIUM,
+                "protocol version " + repr(version) + " is not a YYYY-MM-DD revision",
+                location=location,
+                remediation=(
+                    "Protocol revisions are dates. Use "
+                    + CURRENT_SPEC_REVISION
+                    + " or a later revision."
+                ),
+                evidence={"version": version},
+            )
+    elif _revision_is_older(version, CURRENT_SPEC_REVISION):
+        report.add(
+            "MCP070",
+            Severity.HIGH,
+            "protocol version " + repr(version) + " is older than the current "
+            "revision " + CURRENT_SPEC_REVISION,
+            location=location,
+            remediation=(
+                "Upgrade to "
+                + CURRENT_SPEC_REVISION
+                + ": the initialize handshake is gone and server/discover is required."
+            ),
+            evidence={"version": version, "current": CURRENT_SPEC_REVISION},
+        )
+
+    # MCP071: removed methods still implemented or advertised.
+    implemented = manifest.get("methods") or manifest.get("implementedMethods")
+    advertised = manifest.get("advertisedMethods")
+    removed_seen = {}
+    for source, collection in (
+        ("methods", implemented),
+        ("advertisedMethods", advertised),
+    ):
+        if not isinstance(collection, (list, tuple)):
+            continue
+        for method in collection:
+            if not isinstance(method, str):
+                continue
+            if method in REMOVED_METHODS:
+                removed_seen.setdefault(method, source)
+    # A legacy "initialize" advertised in capabilities implies the
+    # handshake even when there is no explicit methods list.
+    if "initialize" not in removed_seen:
+        caps = manifest.get("capabilities")
+        if isinstance(caps, Mapping) and "initialize" in caps:
+            removed_seen["initialize"] = "capabilities"
+    for method, source in sorted(removed_seen.items()):
+        report.add(
+            "MCP071",
+            Severity.HIGH,
+            "server still exposes removed method " + repr(method) + " - "
+            + REMOVED_METHODS[method],
+            location=source,
+            remediation=(
+                "Remove the method and implement server/discover plus the "
+                "stateless request shape (protocol version in _meta)."
+            ),
+            evidence={"method": method, "source": source},
+        )
+
+    # MCP072: deprecated capabilities.
+    caps = manifest.get("capabilities")
+    if isinstance(caps, Mapping):
+        for capability, why in sorted(DEPRECATED_CAPABILITIES.items()):
+            if capability in caps:
+                report.add(
+                    "MCP072",
+                    Severity.MEDIUM,
+                    "capability " + repr(capability) + " is deprecated - " + why,
+                    location="capabilities." + capability,
+                    remediation=(
+                        "Do not advertise deprecated features in new implementations. "
+                        "Pass directories or files as tool parameters instead."
+                    ),
+                    evidence={"capability": capability},
+                )
+
+    # MCP073: deprecated transports.
+    for transport in manifest.get("transports") or []:
+        if not isinstance(transport, Mapping):
+            continue
+        kind = str(transport.get("type") or "").strip().lower()
+        if kind in DEPRECATED_TRANSPORTS:
+            report.add(
+                "MCP073",
+                Severity.MEDIUM,
+                "transport " + repr(kind) + " is deprecated - "
+                + DEPRECATED_TRANSPORTS[kind],
+                location="transports." + kind,
+                remediation="Serve this server over Streamable HTTP or stdio.",
+                evidence={"transport": kind},
+            )
+    transport_type = manifest.get("transport") or manifest.get("transportType")
+    if isinstance(transport_type, str):
+        low = transport_type.strip().lower()
+        if low in DEPRECATED_TRANSPORTS and not any(
+            isinstance(t, Mapping)
+            and str(t.get("type") or "").strip().lower() == low
+            for t in (manifest.get("transports") or [])
+        ):
+            report.add(
+                "MCP073",
+                Severity.MEDIUM,
+                "transport " + repr(low) + " is deprecated - " + DEPRECATED_TRANSPORTS[low],
+                location="transport",
+                remediation="Serve this server over Streamable HTTP or stdio.",
+                evidence={"transport": low},
+            )
+
+
 # ---------- Public API ----------
 
 CHECK_NAMES = frozenset(
@@ -733,6 +1007,7 @@ CHECK_NAMES = frozenset(
         "tools",
         "prompts",
         "annotations",
+        "protocol",
     ]
 )
 
@@ -744,6 +1019,7 @@ _RUNNERS = {
     "tools": _check_tools,
     "prompts": _check_prompts,
     "annotations": _check_annotations,
+    "protocol": _check_protocol,
 }
 
 
@@ -818,6 +1094,10 @@ def audit_many(paths, checks=None):
 __all__ = [
     "AuditReport",
     "CHECK_NAMES",
+    "CURRENT_SPEC_REVISION",
+    "REMOVED_METHODS",
+    "DEPRECATED_CAPABILITIES",
+    "DEPRECATED_TRANSPORTS",
     "Finding",
     "Severity",
     "audit_file",
@@ -842,7 +1122,7 @@ options:
   --quiet                      only print the one-line summary
   -h, --help                   show this message
 
-checks: identity, secrets, transport, resources, tools, prompts, annotations
+checks: identity, secrets, transport, resources, tools, prompts, annotations, protocol
 """
 
 

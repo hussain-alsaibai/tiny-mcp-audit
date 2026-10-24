@@ -5,7 +5,7 @@
 
 [![Python](https://img.shields.io/pypi/pyversions/tiny-mcp-audit.svg)](https://pypi.org/project/tiny-mcp-audit/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-56%20passed-brightgreen.svg)](#)
+[![Tests](https://img.shields.io/badge/tests-82%20passed-brightgreen.svg)](#)
 
 ## Why?
 
@@ -57,6 +57,7 @@ mcp-audit manifest.json --format json         # machine-readable
 mcp-audit manifest.json --format sarif        # GitHub code scanning
 mcp-audit *.json --fail-on critical           # only block on the worst
 mcp-audit manifest.json --checks tools,secrets # run a subset
+mcp-audit manifest.json --checks protocol       # spec conformance only
 ```
 
 Exit codes: `0` clean - `1` findings at or above `--fail-on` (default `high`) - `2` usage error - `3` unreadable manifest.
@@ -85,6 +86,35 @@ Exit codes: `0` clean - `1` findings at or above `--fail-on` (default `high`) - 
 | MCP051 | low | prompt has no description |
 | MCP060 | low | tool missing `readOnlyHint` / `destructiveHint` |
 | MCP061 | low | `readOnlyHint` present but not boolean |
+| MCP070 | high | protocol version missing, malformed, or older than the current revision |
+| MCP071 | high | server still exposes a method the current revision removed |
+| MCP072 | medium | server advertises a deprecated capability (roots / sampling / logging) |
+| MCP073 | medium | server advertises a deprecated transport (HTTP+SSE) |
+
+### Protocol conformance (`protocol`)
+
+The `protocol` check group verifies a manifest against the **current MCP
+specification revision** (`2026-07-28`). The 2026-07-28 revision removed the
+`initialize` handshake entirely, made MCP stateless, and made `server/discover`
+mandatory. Servers still speaking the old dialect are invisible to modern
+clients — they negotiate a revision nobody offers.
+
+| Check | What it catches |
+|---|---|
+| MCP070 | No `protocolVersion`, a non-date version like `1.0`, or a revision older than current |
+| MCP071 | `initialize`, `ping`, `logging/setLevel`, `resources/subscribe` and other removed methods still advertised |
+| MCP072 | `roots`, `sampling`, `logging` capabilities advertised |
+| MCP073 | The deprecated HTTP+SSE transport |
+
+```bash
+# Diagnose a server that modern clients cannot reach
+mcp-audit server.json --checks protocol
+```
+
+The revision is looked up in `protocolVersion`, `protocol_version`,
+`specVersion`, `discover.protocolVersions`, and
+`_meta.io.modelcontextprotocol/protocolVersion`, so it works against both a
+raw manifest and a captured `server/discover` response.
 
 ## Design notes
 
