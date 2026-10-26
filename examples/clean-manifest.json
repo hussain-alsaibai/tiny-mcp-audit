@@ -1,14 +1,26 @@
 {
+  "protocolVersion": "2026-07-28",
   "serverInfo": {
     "name": "acme-db-mcp",
     "version": "0.3.1",
     "description": "Read-only analytics queries against the Acme reporting replica."
   },
-  "capabilities": { "tools": {}, "resources": {} },
+  "capabilities": {
+    "tools": {},
+    "resources": {}
+  },
   "transports": [
-    { "type": "stdio", "command": "acme-db-mcp", "args": ["--read-only"] }
+    {
+      "type": "stdio",
+      "command": "acme-db-mcp",
+      "args": [
+        "--read-only"
+      ]
+    }
   ],
-  "env": { "ACME_DB_URL": "postgres://reader@replica.internal/acme" },
+  "env": {
+    "ACME_DB_URL": "postgres://reader@replica.internal/acme"
+  },
   "tools": [
     {
       "name": "run_query",
@@ -16,10 +28,19 @@
       "inputSchema": {
         "type": "object",
         "properties": {
-          "sql": { "type": "string", "description": "A SELECT statement." },
-          "limit": { "type": "integer", "minimum": 1, "maximum": 1000 }
+          "sql": {
+            "type": "string",
+            "description": "A SELECT statement."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000
+          }
         },
-        "required": ["sql"]
+        "required": [
+          "sql"
+        ]
       },
       "annotations": {
         "readOnlyHint": true,
