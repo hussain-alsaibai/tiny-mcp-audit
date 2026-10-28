@@ -722,6 +722,292 @@ def _check_annotations(report, manifest):
             )
 
 
+# ---------- Server Card validation (MCP074) ----------
+
+# SEP-2127 defines the Server Card: a static metadata document describing a
+# remote MCP server for PRE-CONNECTION discovery. It is the document a client
+# fetches before it knows anything about the server.
+#
+# Why this rule exists: a Server Card is fetched from a URL the server
+# controls and read by an agent before any human sees it. That is the same
+# trust shape as the Radware finding (86 million GitHub items scanned, ~2.5
+# prompt injections per 100,000 items, including instructions hidden in HTML
+# comments): attacker-controlled metadata that a model reads and may act on.
+# A card whose description or headers carry instructions is the same attack,
+# delivered through the protocol.
+#
+# The schema (modelcontextprotocol/experimental-ext-server-card, schema.ts)
+# requires $schema, name, version and description. Optional: title,
+# websiteUrl, repository, icons, remotes, _meta.
+#
+# The card deliberately does NOT enumerate primitives. That is a safety
+# property of the spec, not a gap: clients cannot use a static card for
+# access-control decisions. So this rule does not flag a missing tools list -
+# that would be flagging the spec's own design.
+
+SERVER_CARD_SCHEMA_URL = "https://static.modelcontextprotocol.io/schemas/v1/server-card.schema.json"
+
+# Instructions aimed at the model rather than the human reader. These are the
+# phrases that turn a metadata document into an injection payload.
+SERVER_CARD_INJECTION_PATTERNS = (
+    (re.compile(r"(?i)\bignore (?:all |any |the )?(?:previous|prior|preceding|above)\b"), "ignores prior instructions"),
+    (re.compile(r"(?i)\bdisregard (?:all |any |the )?(?:previous|prior|preceding|above)\b"), "disregards prior instructions"),
+    (re.compile(r"(?i)\byou are now\b"), "reassigns the assistant's role"),
+    (re.compile(r"(?i)\bnew instructions?\b"), "introduces fresh instructions"),
+    (re.compile(r"(?i)\bsystem prompt\b"), "references the system prompt"),
+    (re.compile(r"(?i)\b(?:call|invoke|run|execute) (?:the )?[\w ]*tool\b"), "instructs a tool call"),
+    (re.compile(r"(?i)\bbefore (?:using|calling|connecting) (?:any|this) tool\b"), "instructs a tool call"),
+    (re.compile(r"(?i)\b(?:exfiltrate|send|upload|post) (?:the |all |your )?(?:credentials?|secrets?|tokens?|keys?|env)\b"), "requests credential disclosure"),
+    (re.compile(r"(?i)\bread (?:the |all )?(?:~/.ssh|/etc/passwd|\.env)\b"), "requests sensitive file reads"),
+)
+
+# Header names that carry credentials. A Server Card is public by design, so a
+# card that hard-codes one of these is leaking it to every crawler.
+SERVER_CARD_SECRET_HEADER_NAMES = frozenset({
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "api-key",
+    "x-auth-token",
+    "x-access-token",
+    "x-amz-security-token",
+})
+
+
+def _server_card_text_values(card):
+    """Every free-text string in a card that a model may read.
+
+    Returns (location, value) pairs. The card is public metadata, so every
+    one of these strings is attacker-influenced and model-readable.
+    """
+    out = []
+    for key in ("description", "title", "websiteUrl"):
+        val = card.get(key)
+        if isinstance(val, str):
+            out.append((key, val))
+    repo = card.get("repository")
+    if isinstance(repo, Mapping):
+        for key in ("url", "source", "subfolder"):
+            val = repo.get(key)
+            if isinstance(val, str):
+                out.append(("repository." + key, val))
+    icons = card.get("icons")
+    if isinstance(icons, list):
+        for idx, icon in enumerate(icons):
+            if isinstance(icon, Mapping):
+                src = icon.get("src")
+                if isinstance(src, str):
+                    out.append(("icons[" + str(idx) + "].src", src))
+    remotes = card.get("remotes")
+    if isinstance(remotes, list):
+        for idx, remote in enumerate(remotes):
+            if not isinstance(remote, Mapping):
+                continue
+            url = remote.get("url")
+            if isinstance(url, str):
+                out.append(("remotes[" + str(idx) + "].url", url))
+            variables = remote.get("variables")
+            if isinstance(variables, Mapping):
+                for vname, spec in variables.items():
+                    if not isinstance(spec, Mapping):
+                        continue
+                    for field in ("description", "default", "placeholder", "value"):
+                        val = spec.get(field)
+                        if isinstance(val, str):
+                            out.append((
+                                "remotes[" + str(idx) + "].variables." + str(vname) + "." + field,
+                                val,
+                            ))
+            headers = remote.get("headers")
+            if isinstance(headers, list):
+                for hidx, header in enumerate(headers):
+                    if not isinstance(header, Mapping):
+                        continue
+                    hname = header.get("name")
+                    if isinstance(hname, str):
+                        out.append((
+                            "remotes[" + str(idx) + "].headers[" + str(hidx) + "].name",
+                            hname,
+                        ))
+                    for field in ("value", "description"):
+                        hval = header.get(field)
+                        if isinstance(hval, str):
+                            out.append((
+                                "remotes[" + str(idx) + "].headers[" + str(hidx) + "]." + field,
+                                hval,
+                            ))
+    meta = card.get("_meta")
+    if isinstance(meta, Mapping):
+        for mkey, mval in meta.items():
+            if isinstance(mval, str):
+                out.append(("_meta." + str(mkey), mval))
+    return out
+
+
+def _check_server_card(report, manifest):
+    """MCP074: validate an MCP Server Card document (SEP-2127)."""
+    card = manifest.get("serverCard")
+    if card is None:
+        card = manifest.get("server_card")
+    if card is None:
+        return
+    if not isinstance(card, Mapping):
+        report.add(
+            "MCP074",
+            Severity.HIGH,
+            "serverCard must be a JSON object, got " + type(card).__name__,
+            location="serverCard",
+            remediation="Make serverCard an object conforming to the Server Card schema.",
+        )
+        return
+
+    # -- required fields --------------------------------------------------
+    schema = card.get("$schema")
+    if not isinstance(schema, str) or not schema.strip():
+        report.add(
+            "MCP074",
+            Severity.MEDIUM,
+            "Server Card is missing $schema",
+            location="serverCard.$schema",
+            remediation="Set $schema to " + SERVER_CARD_SCHEMA_URL,
+        )
+    elif schema != SERVER_CARD_SCHEMA_URL:
+        report.add(
+            "MCP074",
+            Severity.LOW,
+            "Server Card $schema is not the v1 schema URL",
+            location="serverCard.$schema",
+            remediation="Use " + SERVER_CARD_SCHEMA_URL,
+            evidence={"found": schema[:200]},
+        )
+
+    name = card.get("name")
+    if not isinstance(name, str) or not name.strip():
+        report.add(
+            "MCP074",
+            Severity.MEDIUM,
+            "Server Card is missing name",
+            location="serverCard.name",
+            remediation="Set name to a reverse-DNS identifier, e.g. 'acme/weather'.",
+        )
+    elif name.count("/") != 1:
+        report.add(
+            "MCP074",
+            Severity.LOW,
+            "Server Card name is not in reverse-DNS form (namespace/server)",
+            location="serverCard.name",
+            remediation="Use exactly one forward slash: 'namespace/server'.",
+            evidence={"found": name[:200]},
+        )
+
+    version = card.get("version")
+    if not isinstance(version, str) or not version.strip():
+        report.add(
+            "MCP074",
+            Severity.LOW,
+            "Server Card is missing version",
+            location="serverCard.version",
+            remediation="Set version to a semver string such as '1.0.2'.",
+        )
+    elif re.search(r"[\^~]|>=|\*", version):
+        report.add(
+            "MCP074",
+            Severity.MEDIUM,
+            "Server Card version is a range, not a version",
+            location="serverCard.version",
+            remediation="Server Cards declare a concrete version; ranges are rejected.",
+            evidence={"found": version[:120]},
+        )
+
+    description = card.get("description")
+    if not isinstance(description, str) or not description.strip():
+        report.add(
+            "MCP074",
+            Severity.LOW,
+            "Server Card is missing description",
+            location="serverCard.description",
+            remediation="Describe what the server does, in one line.",
+        )
+
+    # -- prompt injection in model-readable text ---------------------------
+    for location, value in _server_card_text_values(card):
+        for pattern, why in SERVER_CARD_INJECTION_PATTERNS:
+            if pattern.search(value):
+                report.add(
+                    "MCP074",
+                    Severity.CRITICAL,
+                    "Server Card text contains embedded instructions (" + why + ")",
+                    location="serverCard." + location,
+                    remediation=(
+                        "A Server Card is public metadata read by agents before any human "
+                        "review. Remove the instruction-like text; describe capabilities only."
+                    ),
+                    evidence={"matched": pattern.pattern},
+                )
+                break
+
+    # -- credentials in headers ---------------------------------------------
+    remotes = card.get("remotes")
+    if isinstance(remotes, list):
+        for idx, remote in enumerate(remotes):
+            if not isinstance(remote, Mapping):
+                continue
+            headers = remote.get("headers")
+            if not isinstance(headers, list):
+                continue
+            for hidx, header in enumerate(headers):
+                if not isinstance(header, Mapping):
+                    continue
+                hname = header.get("name")
+                if not isinstance(hname, str):
+                    continue
+                loc = "serverCard.remotes[" + str(idx) + "].headers[" + str(hidx) + "]"
+                value = header.get("value")
+                if hname.strip().lower() in SERVER_CARD_SECRET_HEADER_NAMES:
+                    if isinstance(value, str) and value.strip():
+                        # A value in a public card is a leak, whatever else is set.
+                        report.add(
+                            "MCP074",
+                            Severity.CRITICAL,
+                            "Server Card hard-codes a credential header '" + hname + "'",
+                            location=loc,
+                            remediation=(
+                                "Server Cards are public by design. Move the credential to a "
+                                "variable with isSecret, and let the client supply it."
+                            ),
+                            evidence={"header": hname},
+                        )
+                    elif not header.get("isSecret"):
+                        # No value and no isSecret: the header name is published
+                        # and the client is not told to prompt for it. Flag it
+                        # so the author adds isSecret.
+                        report.add(
+                            "MCP074",
+                            Severity.MEDIUM,
+                            "Server Card declares credential header '" + hname + "' without a value",
+                            location=loc,
+                            remediation=(
+                                "Declare it as a variable with isSecret so the client prompts "
+                                "for it, rather than shipping the header name."
+                            ),
+                            evidence={"header": hname},
+                        )
+                    # No value and isSecret set: the documented way to ask for a
+                    # credential without publishing it. Not a finding.
+                elif isinstance(value, str):
+                    if any(rx.search(value) for _label, rx in SECRET_PATTERNS):
+                        report.add(
+                            "MCP074",
+                            Severity.CRITICAL,
+                            "Server Card header '" + hname + "' contains a literal secret",
+                            location=loc,
+                            remediation="Use a variable with isSecret instead of a literal value.",
+                            evidence={"header": hname},
+                        )
+
+
 # ---------- Protocol conformance (MCP spec 2026-07-28) ----------
 
 # The current specification revision. Date-based, not semver: the spec
@@ -1047,6 +1333,7 @@ CHECK_NAMES = frozenset(
         "prompts",
         "annotations",
         "protocol",
+        "server_card",
     ]
 )
 
@@ -1059,6 +1346,7 @@ _RUNNERS = {
     "prompts": _check_prompts,
     "annotations": _check_annotations,
     "protocol": _check_protocol,
+    "server_card": _check_server_card,
 }
 
 
