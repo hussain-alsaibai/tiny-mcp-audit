@@ -3,7 +3,7 @@
 > **Static security audit for MCP server manifests.**  
 > Catch risky declarations before a client ever connects. No network access, no sandbox, no dependencies.
 
-[![Python](https://img.shields.io/pypi/pyversions/tiny-mcp-audit.svg)](https://pypi.org/project/tiny-mcp-audit/)
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://github.com/hussain-alsaibai/tiny-mcp-audit#install)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-82%20passed-brightgreen.svg)](#)
 
