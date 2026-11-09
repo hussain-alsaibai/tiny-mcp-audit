@@ -3,7 +3,14 @@ import os
 import tempfile
 
 import tiny_mcp_audit as mcp
-from tiny_mcp_audit import Severity, audit_json, audit_manifest
+from tiny_mcp_audit import (
+    CHECK_NAMES,
+    CURRENT_SPEC_REVISION,
+    Severity,
+    audit_file,
+    audit_json,
+    audit_manifest,
+)
 
 
 def good_manifest():
@@ -981,3 +988,100 @@ def test_unknown_check_still_errors():
     assert "unknown check" in report.error
 
 
+
+
+# ---- MCP075-MCP077: path canonicalisation (CVE-2026-103572 family) ---------
+#
+# CVE-2026-103572 was an agent guard that compared the *literal* path to its
+# own config file. The agent proposed `.mcp.json.`; the guard saw a different
+# string; Windows stripped the trailing dot on write and the file resolved to
+# the real config. The bypasses below are all the same defect: a string
+# comparison standing in for a filesystem identity comparison.
+
+
+def _path_manifest(*args, server="probe"):
+    return {
+        "protocolVersion": CURRENT_SPEC_REVISION,
+        "serverInfo": {"name": "path-probe", "version": "1.0.0"},
+        "tools": [],
+        "mcpServers": {server: {"command": "probe", "args": list(args)}},
+    }
+
+
+def test_trailing_dot_config_path_is_high():
+    """The exact CVE-2026-103572 spelling."""
+    report = audit_manifest(
+        _path_manifest("--config", "C:\\Users\\dev\\.vscode\\.mcp.json."),
+        checks=["paths"],
+    )
+    findings = report.find("MCP075")
+    assert len(findings) == 1
+    assert findings[0].severity == Severity.HIGH
+    assert "trailing dot" in findings[0].message
+
+
+def test_trailing_space_config_path_is_high():
+    report = audit_manifest(
+        _path_manifest("/home/dev/.mcp.json "), checks=["paths"]
+    )
+    assert report.find("MCP075"), "a trailing space is stripped by Win32 too"
+
+
+def test_case_variant_config_path_is_high():
+    report = audit_manifest(
+        _path_manifest("/home/dev/.config/.MCP.JSON"), checks=["paths"]
+    )
+    assert report.find("MCP075")
+
+
+def test_percent_encoded_config_path_is_high():
+    report = audit_manifest(_path_manifest("%2e%6dcp.json"), checks=["paths"])
+    assert report.find("MCP075")
+    assert "percent-encoded" in report.find("MCP075")[0].message
+
+
+def test_alternate_data_stream_is_high():
+    report = audit_manifest(
+        _path_manifest("C:\\Users\\dev\\.mcp.json::$DATA"), checks=["paths"]
+    )
+    assert report.find("MCP075")
+
+
+def test_canonical_config_path_is_medium_not_high():
+    """Naming the config is capability, not a bypass. It must not read as
+    critical-path risk, or the rule cries wolf on every legit config tool."""
+    report = audit_manifest(
+        _path_manifest("--config", "/home/dev/.mcp.json"), checks=["paths"]
+    )
+    assert report.find("MCP075") == []
+    found = report.find("MCP076")
+    assert len(found) == 1
+    assert found[0].severity == Severity.MEDIUM
+
+
+def test_relative_traversal_into_ssh_is_flagged():
+    report = audit_manifest(
+        _path_manifest("./cfg/../.ssh/id_rsa"), checks=["paths"]
+    )
+    assert report.find("MCP076")
+
+
+def test_ordinary_path_is_not_flagged():
+    report = audit_manifest(_path_manifest("--out", "/tmp/report.json"), checks=["paths"])
+    assert report.find("MCP075") == []
+    assert report.find("MCP076") == []
+    assert report.find("MCP077") == []
+
+
+def test_bundled_examples_stay_clean_under_the_path_rule():
+    """A rule that fires on our own fixtures is a rule with a false positive."""
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    report = audit_file(os.path.join(here, "examples", "clean-manifest.json"), checks=["paths"])
+    assert report.findings == []
+
+
+def test_paths_check_runs_in_the_default_check_set():
+    assert "paths" in CHECK_NAMES
+    report = audit_manifest(_path_manifest("/home/dev/.mcp.json."))
+    assert report.find("MCP075"), "paths must run when checks=None"

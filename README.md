@@ -5,7 +5,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://github.com/hussain-alsaibai/tiny-mcp-audit#install)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-82%20passed-brightgreen.svg)](#)
+[![Tests](https://img.shields.io/badge/tests-119%20passed-brightgreen.svg)](#)
 
 ## Why?
 
@@ -90,6 +90,9 @@ Exit codes: `0` clean - `1` findings at or above `--fail-on` (default `high`) - 
 | MCP071 | high / info | server exposes a removed method; **info** when `server/discover` is also implemented (recommended bridge) |
 | MCP072 | medium | server advertises a deprecated capability (roots / sampling / logging) |
 | MCP073 | medium | server advertises a deprecated transport (HTTP+SSE) |
+| MCP075 | **high** | path argument reaches a host config or credential dir through a non-canonical spelling (trailing dot, case variant, `%2e`, `::$DATA`, 8.3) |
+| MCP076 | medium | path argument names a protected config/credential path directly, or walks to one with `..` |
+| MCP077 | low | path argument is not in canonical form |
 
 ### Protocol conformance (`protocol`)
 
@@ -135,6 +138,51 @@ legacy server (unreachable)      bridge (recommended)
   [HIGH] MCP071  ping
   grade F, blocks CI
 ```
+
+### Path canonicalisation (`paths`)
+
+CVE-2026-103572 is the first MCP-adjacent **config-write** vulnerability with
+a public write-up: an agent host in Copilot for Visual Studio / SSMS guarded
+writes to its own `.mcp.json` by comparing the *literal* path it was about to
+write. The agent appended a trailing dot — `.mcp.json.` — and the guard saw a
+different string. Windows strips trailing dots at write time, so the file
+resolved to the real config. The agent could therefore edit the file that
+decides which MCP servers it may run.
+
+The trailing dot is one instance of a general defect: **a string comparison
+standing in for a filesystem identity comparison.** Every denylist built that
+way inherits the same bypasses, and each platform contributes its own:
+
+| Spelling | Resolves to the same file | Where |
+|---|---|---|
+| `.mcp.json.` / `.mcp.json ` | yes | Win32 strips trailing dots and spaces |
+| `.MCP.JSON` | yes | NTFS / APFS fold case |
+| `MCPJSON~1` | yes | 8.3 short names |
+| `.mcp.json::$DATA` | yes | NTFS alternate data stream |
+| `%2e%6dcp.json` | yes | percent-decoding filesystem APIs |
+| `./x/../.mcp.json` | yes | path normalisation |
+
+The `paths` check inspects the arguments a manifest passes to a server and
+flags the spellings a string denylist cannot see. It never touches the
+filesystem — a static auditor that opened files to resolve symlinks would be
+doing the thing it warns about — so it reports what is decidable from the
+string and says so.
+
+```bash
+mcp-audit config.json --checks paths
+```
+
+```
+[HIGH]   MCP075 @ mcpServers.fs.args.1: argument 'C:\\Users\\dev\\.vscode\\.mcp.json.'
+         reaches protected config '.mcp.json' via a trailing dot or space
+[MEDIUM] MCP076 @ mcpServers.fs.args.3: argument '/home/dev/.mcp.json'
+         names protected '.mcp.json' directly
+```
+
+**The fix class, not the patch:** canonicalise before comparing —
+`realpath()` then case-fold then strip trailing dots and spaces — and deny the
+*resolved* location. A tool that can write a host's MCP config can choose which
+servers run; that is command execution with one extra step.
 
 ## Design notes
 

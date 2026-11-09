@@ -39,7 +39,7 @@ from enum import Enum
 from typing import Any, Iterable, Mapping
 
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 
 # ---------- Severity ----------
@@ -1321,6 +1321,266 @@ def _check_protocol(report, manifest):
             )
 
 
+# ---------- Path canonicalisation (MCP075-MCP077) ----------
+
+# CVE-2026-103572: an agent-host guard in Copilot for Visual Studio / SSMS
+# blocked writes to its own `.mcp.json` by comparing the *literal* path the
+# agent proposed. The agent proposed `.mcp.json.` - the guard saw a different
+# string and allowed it, and Windows stripped the trailing dot at write time,
+# resolving to the real config. The agent then edited the file that decides
+# which MCP servers it may run, and the next write was arbitrary command
+# execution.
+#
+# The general defect is not the trailing dot. It is that a *string comparison*
+# was standing in for a *filesystem identity comparison*. Every denylist that
+# works this way inherits the same bypasses, and they differ per platform:
+#
+#   - trailing dots and spaces   -> stripped by Win32, kept by POSIX
+#   - case                         -> folded on NTFS/APFS, kept on ext4
+#   - 8.3 short names              -> MCPJSON~1, Windows only
+#   - alternat data streams        -> `.mcp.json::$DATA`
+#   - .. / . segments              -> `./.mcp.json`, `a/../.mcp.json`
+#   - percent / unicode escapes    -> `%2e%6dcp.json`, `mcp\uff0ejson`
+#   - symlinks and hardlinks       -> different path, same inode
+#
+# A static auditor cannot resolve a symlink without touching the filesystem,
+# and this package is deliberately offline. So the rule is honest about what
+# it can prove: it flags every spelling that *differs from the canonical form*,
+# and it flags the trailing-dot/space and case-variant shapes that are exactly
+# the CVE-2026-103572 family, because those are decidable from the string.
+
+# Files whose contents decide which servers run or which credentials are used.
+# Editing any of them is equivalent to executing code on the host.
+PROTECTED_CONFIG_NAMES = frozenset(
+    [
+        ".mcp.json",
+        "mcp.json",
+        "mcp-config.json",
+        "claude_desktop_config.json",
+        "settings.json",
+        "vscode-settings.json",
+        "gemini-settings.json",
+        "cline_mcp_settings.json",
+        "continue-config.json",
+        "mcp-servers.json",
+    ]
+)
+
+# Directories that hold the credentials a config write would be aiming at.
+PROTECTED_DIR_PARTS = frozenset(
+    [".ssh", ".aws", ".gnupg", ".config", ".kube", ".docker", ".npm", ".netrc"]
+)
+
+_ASCII_FOLD = {chr(c): chr(c + 32) for c in range(ord("A"), ord("Z") + 1)}
+_FOLD_TABLE = str.maketrans(_ASCII_FOLD)
+
+
+def _canonical_path_name(raw):
+    """Canonical form of one path component for denylist comparison.
+
+    Lowercases, decodes the escapes that filesystem APIs decode, and strips
+    the trailing dots and spaces that Win32 silently discards. Returns "" for
+    a component that canonicalises to nothing (".", "..", "..\t", ...).
+    """
+    if not isinstance(raw, str):
+        return ""
+    name = raw.strip()
+    # Percent escapes: %2e -> '.', %6d -> 'm'. Real resolvers decode these.
+    name = re.sub(
+        r"%([0-9A-Fa-f]{2})",
+        lambda m: chr(int(m.group(1), 16)),
+        name,
+    )
+    # Windows short-name generation is lossy in the other direction; a
+    # component containing "~<digit>" is a candidate 8.3 alias.
+    name = name.translate(_FOLD_TABLE)
+    # NTFS treats these as session separators, not part of the name.
+    name = name.split("::$data", 1)[0]
+    # Win32 strips every trailing dot and space, repeatedly.
+    name = name.rstrip(" .\t")
+    return name
+
+
+def _path_is_suspicious(raw, canonical):
+    """Why this raw component is not the canonical spelling, or ""."""
+    if not isinstance(raw, str):
+        return ""
+    # Only leading whitespace is padding. A trailing space is itself part of
+    # the Win32 bypass, so it must survive stripping and be reported.
+    stripped = raw.lstrip()
+    folded_raw = stripped.translate(_FOLD_TABLE)
+    # `..` as a path component is traversal, reported by MCP076. Judging it
+    # as a "trailing dot" hides the real reason.
+    if folded_raw in ("", ".", ".."):
+        return ""
+    if folded_raw != stripped:
+        return "mixed or non-canonical case"
+    if re.search(r"%[0-9A-Fa-f]{2}", raw):
+        return "percent-encoded component"
+    if folded_raw.endswith(".") or folded_raw.endswith(" "):
+        return "trailing dot or space"
+    if "::$data" in folded_raw:
+        return "alternate data stream"
+    if re.search(r"~[0-9]+$", folded_raw):
+        return "8.3 short name"
+    if "\\" + "u00" in raw.lower() or "\uff0e" in raw:
+        return "unicode escape or fullwidth separator"
+    return ""
+
+
+def _iter_path_arguments(manifest):
+    """Yield (location, raw_path) for every path-shaped manifest argument.
+
+    Covers the two shapes a client actually reads: the `mcpServers` map used
+    by every desktop host config, and a generic `servers`/`tools` list whose
+    entries carry `args`.
+    """
+    def emit(prefix, args):
+        if not isinstance(args, (list, tuple)):
+            return
+        for idx, arg in enumerate(args):
+            if isinstance(arg, str) and arg.strip():
+                yield prefix + "." + str(idx), arg
+
+    for key in ("mcpServers", "servers"):
+        servers = manifest.get(key)
+        if isinstance(servers, Mapping):
+            for name, entry in servers.items():
+                if isinstance(entry, Mapping):
+                    yield from emit(key + "." + str(name) + ".args", entry.get("args"))
+        elif isinstance(servers, (list, tuple)):
+            for idx, entry in enumerate(servers):
+                if isinstance(entry, Mapping):
+                    yield from emit(key + "." + str(idx) + ".args", entry.get("args"))
+
+
+def _check_paths(report, manifest):
+    """MCP075-MCP077: path arguments that a string denylist would miss.
+
+    - MCP075 (high): an argument points at a protected config file or
+      credential directory using a non-canonical spelling - the
+      CVE-2026-103572 trailing-dot and case-variant family.
+    - MCP076 (medium): an argument is a relative path containing "." or ".."
+      segments that resolve to a protected location.
+    - MCP077 (low): an argument contains a percent escape or a Unicode
+      look-alike separator, which resolves differently than it reads.
+    """
+    for location, raw in _iter_path_arguments(manifest):
+        # Both separators: manifests are written on one OS and run on another.
+        parts = re.split(r"[\\/]+", raw)
+        canonical_parts = [_canonical_path_name(p) for p in parts]
+        effective = [p for p in canonical_parts if p and p not in (".", "..")]
+
+        hit_config = ""
+        hit_dir = ""
+        for original, canonical in zip(parts, canonical_parts):
+            if not canonical:
+                continue
+            if canonical in PROTECTED_CONFIG_NAMES:
+                hit_config = canonical
+            elif canonical in PROTECTED_DIR_PARTS:
+                hit_dir = canonical
+
+        reason = _path_is_suspicious(parts[-1] if parts else raw, canonical_parts[-1] if canonical_parts else "")
+        if not reason:
+            for original in parts:
+                reason = _path_is_suspicious(original, _canonical_path_name(original))
+                if reason:
+                    break
+
+        if hit_config and reason:
+            report.add(
+                "MCP075",
+                Severity.HIGH,
+                "argument "
+                + repr(raw)
+                + " reaches protected config "
+                + repr(hit_config)
+                + " via a "
+                + reason
+                + " - a string denylist will not match it",
+                location=location,
+                remediation=(
+                    "Compare canonicalised real paths (realpath + case fold + "
+                    "trailing-dot strip), never literal strings. A tool that can "
+                    "write a host's MCP config can choose which servers run."
+                ),
+                evidence={"argument": raw, "target": hit_config, "bypass": reason},
+            )
+        elif hit_dir and reason:
+            report.add(
+                "MCP075",
+                Severity.HIGH,
+                "argument "
+                + repr(raw)
+                + " reaches credential directory "
+                + repr(hit_dir)
+                + " via a "
+                + reason,
+                location=location,
+                remediation=(
+                    "Resolve the path before comparing it, and deny the real "
+                    "location rather than the spelling of it."
+                ),
+                evidence={"argument": raw, "target": hit_dir, "bypass": reason},
+            )
+        elif hit_config or hit_dir:
+            # Canonical spelling of a protected path. Not a bypass, but a tool
+            # that takes a host's *own* config as an argument can rewrite the
+            # list of servers it is allowed to touch. That is capability, not
+            # a vulnerability, so it is recorded at medium.
+            target = hit_config or hit_dir
+            report.add(
+                "MCP076",
+                Severity.MEDIUM,
+                "argument " + repr(raw) + " names protected " + repr(target) + " directly",
+                location=location,
+                remediation=(
+                    "A tool argument that can name the host's MCP config or a "
+                    "credential directory should be denied by resolved path, "
+                    "not allowed and relied upon."
+                ),
+                evidence={"argument": raw, "target": target},
+            )
+        elif reason:
+            report.add(
+                "MCP077",
+                Severity.LOW,
+                "argument " + repr(raw) + " is not in canonical form (" + reason + ")",
+                location=location,
+                remediation=(
+                    "Pass a normalised absolute path so a denylist comparing "
+                    "strings cannot be bypassed by respelling."
+                ),
+                evidence={"argument": raw, "bypass": reason},
+            )
+
+        # MCP076: a *relative* path that walks to a protected location. An
+        # absolute path crossing the same components is already covered above
+        # when its spelling is off, and is not traversal when it is not.
+        is_absolute = raw[:1] in ("/", "\\") or re.match(r"^[A-Za-z]:", raw)
+        if not is_absolute and (".." in canonical_parts or "." in canonical_parts):
+            if any(p in PROTECTED_CONFIG_NAMES or p in PROTECTED_DIR_PARTS for p in effective):
+                already = any(
+                    f.code in ("MCP075", "MCP076") and f.evidence.get("argument") == raw
+                    for f in report.findings
+                )
+                if not already:
+                    report.add(
+                        "MCP076",
+                        Severity.MEDIUM,
+                        "argument "
+                        + repr(raw)
+                        + " is relative and resolves into a protected location",
+                        location=location,
+                        remediation=(
+                            "Require absolute, fully-resolved paths for any "
+                            "argument that names a config or credential."
+                        ),
+                        evidence={"argument": raw},
+                    )
+
+
 # ---------- Public API ----------
 
 CHECK_NAMES = frozenset(
@@ -1334,6 +1594,7 @@ CHECK_NAMES = frozenset(
         "annotations",
         "protocol",
         "server_card",
+        "paths",
     ]
 )
 
@@ -1347,6 +1608,7 @@ _RUNNERS = {
     "annotations": _check_annotations,
     "protocol": _check_protocol,
     "server_card": _check_server_card,
+    "paths": _check_paths,
 }
 
 
