@@ -27,8 +27,10 @@ mcp-audit ./server.json
 
 ## Install
 
+Not on PyPI yet — install from the repository:
+
 ```bash
-pip install tiny-mcp-audit
+pip install git+https://github.com/hussain-alsaibai/tiny-mcp-audit.git
 ```
 
 Zero runtime dependencies. Pure Python 3.9+.
